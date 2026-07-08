@@ -703,6 +703,7 @@ def plot_attenuation(
     df: pd.DataFrame,
     date_str: str,
     show_plot: bool = True,
+    interactive: bool = True,
     save_path: str = None,
     verbose: bool = True,
 ) -> None:
@@ -715,14 +716,21 @@ def plot_attenuation(
       [CH1]  [CH2]
       [CH3]  [CH4]
 
+    This remains a single implementation for both interactive and batch
+    rendering — nothing is duplicated. Two independent flags control it:
+
     Parameters
     ----------
     show_plot : bool, optional
-        If True (default), opens the interactive matplotlib window with
-        hover cursor, permanent markers, zoom/pan, and all existing
-        interactive features.  The function blocks at plt.show() until
-        the window is closed.
-        If False, the window is not displayed.
+        If True (default), opens the matplotlib window and blocks at
+        plt.show() until it is closed.
+        If False, the figure is saved as a PNG and closed instead
+        (no window is ever shown).
+    interactive : bool, optional
+        If True (default), attaches the mplcursors hover tooltip and the
+        permanent-marker click handler (zoom/pan are native Matplotlib
+        window behaviour and are unaffected either way).
+        If False, no cursor callbacks or hover events are connected at all.
     save_path : str or None, optional
         If provided, saves the figure as a PNG (dpi=300, bbox_inches="tight")
         to this path and then closes the figure.  Only used when
@@ -801,11 +809,11 @@ def plot_attenuation(
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     # --- Hover tooltip (mplcursors — temporary) ------------------------------
-    if show_plot:
+    if interactive:
         setup_hover_cursor(line_artists, chan_labels)
 
     # --- Permanent markers (native Matplotlib events) ------------------------
-    if show_plot:
+    if interactive:
         marker_mgr = MarkerManager(axes_flat, df, att_cols)
 
         fig.canvas.mpl_connect(
@@ -841,17 +849,17 @@ def plot_attenuation(
 
 def process_file(
     file_path: str,
-    show_plot: bool = True,
+    dataset_mode: str = "current",
+    processing_mode: str = "single",
     verbose: bool = True,
     output_dir: str = None,
-    dataset_mode: str = "current",
 ) -> dict:
     """
     Public entry point for the analysis engine.
 
     Loads the supplied file, computes references and attenuation,
-    saves the per-second attenuation file, optionally generates the
-    interactive plot, and returns a result dictionary.
+    saves the per-second attenuation file, generates the plot, and
+    returns a result dictionary.
 
     Parameters
     ----------
@@ -860,12 +868,27 @@ def process_file(
         daily data file, e.g. "data/NARL_14_5_2022.txt". For
         dataset_mode="legacy" this is a raw 2017-format file
         (Time, Signal, Reference columns, no header).
-    show_plot : bool, optional
-        If True (default), opens the interactive matplotlib window with
-        hover cursor, permanent markers, zoom/pan, and all existing
-        interactive features.
-        If False, skips the interactive window entirely (for batch mode).
-        The plotting function is preserved and can be called separately.
+    dataset_mode : str, optional
+        "current" (default) processes the 2019-onwards 4-channel NARL format
+        exactly as before. "legacy" first converts the raw 2017 single-channel
+        format into the same internal DataFrame shape, then reuses the
+        identical processing pipeline (reference calculation, attenuation,
+        statistics, plotting, and output files) with a single channel.
+        Answers "what type of dataset am I processing?" and is completely
+        independent of processing_mode below.
+    processing_mode : str, optional
+        "single" (default) — Interactive Single Day / Engineering-Debug mode.
+            The plot is displayed in an interactive matplotlib window with
+            mplcursors hover, permanent click markers, and native zoom/pan,
+            exactly as these features have always worked. The PNG is still
+            saved.
+        "month" or "year" — Batch mode. The plot is rendered and saved as a
+            PNG only; no window is shown, no hover cursor or click markers
+            are attached, and the figure is closed immediately afterwards.
+        Answers "how should the application behave while processing?" and
+        is completely independent of dataset_mode above. show_plot and
+        interactive are both derived from this single value — the plotting
+        function itself (plot_attenuation) is never duplicated.
     verbose : bool, optional
         If True (default), prints all diagnostic output to the console.
         If False, suppresses all console output while still performing all
@@ -874,12 +897,6 @@ def process_file(
         Directory where generated files (txt and png) will be saved.
         If None, files are saved alongside the input file (legacy behaviour).
         The directory is created automatically if it does not exist.
-    dataset_mode : str, optional
-        "current" (default) processes the 2019-onwards 4-channel NARL format
-        exactly as before. "legacy" first converts the raw 2017 single-channel
-        format into the same internal DataFrame shape, then reuses the
-        identical processing pipeline (reference calculation, attenuation,
-        statistics, plotting, and output files) with a single channel.
 
     Returns
     -------
@@ -890,6 +907,10 @@ def process_file(
         "second_dataframe"      : pd.DataFrame — per-second attenuation (1 Hz)
         "attenuation_dataframe" : pd.DataFrame — full-resolution attenuation data
     """
+
+    # ── Plotting behaviour derives ONLY from processing_mode ──────────────────
+    show_plot   = (processing_mode == "single")
+    interactive = (processing_mode == "single")
 
     global CHANNELS
     CHANNELS = CHANNELS_LEGACY if dataset_mode == "legacy" else CHANNELS_CURRENT
@@ -926,7 +947,7 @@ def process_file(
 
     # ── Interactive plot / batch PNG ──────────────────────────────────────────
     if show_plot:
-        plot_attenuation(df, date_str, show_plot=True, verbose=verbose)
+        plot_attenuation(df, date_str, show_plot=True, interactive=interactive, verbose=verbose)
     else:
         png_name = f"Attenuation_{Path(file_path).stem}.png"
         if output_dir is not None:
@@ -935,7 +956,10 @@ def process_file(
             save_path = out_dir / png_name
         else:
             save_path = Path(file_path).parent / png_name
-        plot_attenuation(df, date_str, show_plot=False, save_path=save_path, verbose=verbose)
+        plot_attenuation(
+            df, date_str, show_plot=False, interactive=interactive,
+            save_path=save_path, verbose=verbose,
+        )
 
     # ── Result dictionary ─────────────────────────────────────────────────────
     return {
@@ -947,12 +971,3 @@ def process_file(
     }
 
 
-# ==============================================================================
-# NOTE ON DATASET SELECTION
-# ==============================================================================
-#
-# The analysis engine never asks the user which dataset type to use.
-# dataset_mode is chosen exactly once, in main.py, and is propagated down
-# through batch_processor.py and utils.py to process_file() here. This
-# module simply receives and acts on the value it is given.
-# ==============================================================================

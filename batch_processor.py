@@ -167,6 +167,7 @@ def _clear_lines(n: int) -> None:
 def process_month(
     month_folder,
     dataset_mode: str = "current",
+    processing_mode: str = "month",
     processed_data_root: str = "Processed_Data",
 ):
     """
@@ -181,6 +182,12 @@ def process_month(
         asks the user anything. It is forwarded to find_main_data_file()
         (so the correct raw filename convention is searched for) and to
         process_file() (so the correct loader/parser is used).
+    processing_mode : str, optional
+        "month" (default) or "year". Chosen exactly once by the user in
+        main.py, independent of dataset_mode, and simply forwarded to
+        process_file() so it can derive non-interactive (no display, no
+        hover cursor) plotting behaviour. This function's own folder
+        traversal, dashboard, and progress-bar logic are unaffected.
     processed_data_root : str, optional
         Root directory for all generated output.  Defaults to
         "Processed_Data" (relative to the current working directory).
@@ -243,10 +250,10 @@ def process_month(
         main_file = find_main_data_file(folder, dataset_mode=dataset_mode)
         result    = process_file(
             main_file,
-            show_plot=False,
+            dataset_mode=dataset_mode,
+            processing_mode=processing_mode,
             verbose=False,
             output_dir=str(output_dir),
-            dataset_mode=dataset_mode,
         )
 
         if result["status"] == "SUCCESS":
