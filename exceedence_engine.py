@@ -18,11 +18,18 @@ from openpyxl.utils import get_column_letter
 # CONFIGURATION
 # ==============================================================================
 
-TARGET_CHANNEL = "Att_Channel-3"   # Only this channel is analyzed
+TARGET_CHANNELS = [                # Every channel listed here is analyzed
+    "Att_Channel-1",                # in an independent pass, using the same
+    "Att_Channel-3",                # processing pipeline. Add/remove entries
+]                                   # here to change which channels are reported.
 
-LOWER_LIMIT = 1.00                 # Lowest threshold (dB)
-UPPER_LIMIT = 58.00                # Highest threshold (dB)
-STEP_SIZE   = 0.10                 # Threshold step size (dB)
+CHANNEL_UPPER_LIMITS = {            # Highest threshold (dB), per channel.
+    "Att_Channel-1": 60.00,         # Every channel in TARGET_CHANNELS must
+    "Att_Channel-3": 58.00,         # have an entry here.
+}
+
+LOWER_LIMIT = 1.00                 # Lowest threshold (dB) — shared by all channels
+STEP_SIZE   = 0.10                 # Threshold step size (dB) — shared by all channels
 
 MONTH_ORDER = [
     "January", "February", "March", "April", "May", "June",
@@ -109,14 +116,14 @@ def _month_label(month_folder_name: str) -> str:
 # ANALYSIS
 # ==============================================================================
 
-def _build_thresholds():
+def _build_thresholds(upper_limit: float):
     """
-    Builds the list of thresholds from LOWER_LIMIT to UPPER_LIMIT
+    Builds the list of thresholds from LOWER_LIMIT to upper_limit
     (inclusive) in STEP_SIZE increments.  Values are rounded to 2 decimal
     places to avoid floating-point drift.
     """
     thresholds = []
-    n_steps = round((UPPER_LIMIT - LOWER_LIMIT) / STEP_SIZE)
+    n_steps = round((upper_limit - LOWER_LIMIT) / STEP_SIZE)
 
     for i in range(n_steps + 1):
         value = LOWER_LIMIT + (i * STEP_SIZE)
@@ -125,10 +132,10 @@ def _build_thresholds():
     return thresholds
 
 
-def _read_channel_values(file_path):
+def _read_channel_values(file_path, channel_name):
     """
     Reads a single attenuation file and returns a list of valid
-    Att_Channel-3 float values (NaN and +/- infinity excluded).
+    float values for the given channel_name (NaN and +/- infinity excluded).
 
     Skips and warns on unreadable files or missing columns.  Skips
     individual malformed rows without aborting the rest of the file.
@@ -139,16 +146,16 @@ def _read_channel_values(file_path):
         with open(file_path, "r", newline="") as f:
             reader = csv.DictReader(f, delimiter="\t")
 
-            if TARGET_CHANNEL not in (reader.fieldnames or []):
+            if channel_name not in (reader.fieldnames or []):
                 print(
-                    f"Warning: '{TARGET_CHANNEL}' column not found in "
+                    f"Warning: '{channel_name}' column not found in "
                     f"{file_path} — skipping file."
                 )
                 return values
 
             for row in reader:
                 try:
-                    value = float(row[TARGET_CHANNEL])
+                    value = float(row[channel_name])
                 except (ValueError, KeyError):
                     # Corrupted or malformed row — skip just this row
                     continue
@@ -164,9 +171,10 @@ def _read_channel_values(file_path):
     return values
 
 
-def _calculate_month_counts(month_folder, thresholds):
+def _calculate_month_counts(month_folder, thresholds, channel_name):
     """
-    Computes the exceedance count for a single month, for every threshold.
+    Computes the exceedance count for a single month, for every threshold,
+    for the given channel_name.
 
     Returns a dict: {threshold: exceedance_count}
     """
@@ -175,7 +183,7 @@ def _calculate_month_counts(month_folder, thresholds):
     attenuation_files = find_attenuation_files(month_folder)
 
     for file_path in attenuation_files:
-        values = _read_channel_values(file_path)
+        values = _read_channel_values(file_path, channel_name)
 
         for threshold in thresholds:
             exceed_count = sum(1 for v in values if v > threshold)
@@ -184,15 +192,17 @@ def _calculate_month_counts(month_folder, thresholds):
     return month_counts
 
 
-def calculate_monthly_exceedance(year_folder: str, progress_callback=None):
+def calculate_monthly_exceedance(year_folder: str, channel_name: str, progress_callback=None):
     """
     Scans every month folder inside the year folder and computes, for
     every threshold, the number of 1 Hz samples where
-        Att_Channel-3 > Threshold
+        <channel_name> > Threshold
     separately for each month.
 
     Parameters
     ----------
+    channel_name : str
+        The attenuation column to analyze (e.g. "Att_Channel-1").
     progress_callback : callable, optional
         If provided, called as progress_callback(month_label, month_index,
         total_months) immediately after each month finishes processing,
@@ -201,13 +211,13 @@ def calculate_monthly_exceedance(year_folder: str, progress_callback=None):
     Returns
     -------
     thresholds : list of float
-        The sorted list of thresholds (LOWER_LIMIT..UPPER_LIMIT).
+        The sorted list of thresholds (LOWER_LIMIT..channel's upper limit).
     month_labels : list of str
         The month names found, in calendar order.
     counts : dict
         Nested dict: counts[month_label][threshold] = exceedance count (int)
     """
-    thresholds = _build_thresholds()
+    thresholds = _build_thresholds(CHANNEL_UPPER_LIMITS[channel_name])
 
     month_folders = find_months(year_folder)
 
@@ -224,7 +234,7 @@ def calculate_monthly_exceedance(year_folder: str, progress_callback=None):
             found_labels.append(label)
             counts[label] = {t: 0 for t in thresholds}
 
-        month_counts = _calculate_month_counts(month_folder, thresholds)
+        month_counts = _calculate_month_counts(month_folder, thresholds, channel_name)
 
         for threshold in thresholds:
             counts[label][threshold] += month_counts[threshold]
@@ -244,13 +254,16 @@ def calculate_monthly_exceedance(year_folder: str, progress_callback=None):
 # TABLE BUILDING & DISPLAY
 # ==============================================================================
 
-def build_table(thresholds, month_labels, counts):
+def build_table(thresholds, month_labels, counts, upper_limit):
     """
     Builds the output table as a list of rows and a list of headers,
     ready to be passed to tabulate().
 
     Each row:
         [Lower Limit, Upper Limit, <month1 count>, ..., <monthN count>, Total Seconds]
+
+    upper_limit is the channel-specific ceiling used to fill the
+    "Upper Limit" column (each channel may have its own value).
     """
     headers = ["Lower Limit", "Upper Limit"] + month_labels + ["Total Seconds"]
 
@@ -260,7 +273,7 @@ def build_table(thresholds, month_labels, counts):
         month_counts = [counts[label][threshold] for label in month_labels]
         total_seconds = sum(month_counts)
 
-        row = [f"{threshold:.2f}", f"{UPPER_LIMIT:.2f}"] + month_counts + [total_seconds]
+        row = [f"{threshold:.2f}", f"{upper_limit:.2f}"] + month_counts + [total_seconds]
         rows.append(row)
 
     return headers, rows
@@ -294,37 +307,19 @@ def _apply_data_style(cell) -> None:
     cell.border    = _thin_border()
 
 
-def save_report(
-    year: str,
-    headers,
-    rows,
-    output_root: str = "Processed_Data",
-) -> Path:
+def _write_worksheet(ws, headers, rows) -> None:
     """
-    Writes the exceedance report as a professionally formatted Excel workbook
-    (.xlsx) inside <output_root>/Exceedance_Tables/Exceedance_Table_<year>.xlsx
-
-    Worksheet: Monthly Exceedance
-    Columns  : Lower Limit (dB) | Upper Limit (dB) | <months...> | Total Seconds
-    Formatting:
+    Writes one exceedance table (headers + rows) into the given worksheet,
+    using exactly the same formatting as before:
         • Bold, centre-aligned, light-blue header row
         • Thin borders on every cell
         • Numeric cells stored as numbers (not strings)
         • Auto-adjusted column widths
         • First row frozen
 
-    Creates the Exceedance_Tables folder automatically if it does not exist.
-    Returns the full Path of the saved workbook.
+    This is the same logic that previously lived inline inside save_report —
+    extracted unchanged so it can be reused once per channel worksheet.
     """
-    output_dir = Path(output_root) / "Exceedance_Tables"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    report_path = output_dir / f"Exceedance_Table_{year}.xlsx"
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Monthly Exceedance"
-
     # ── Build column headers ──────────────────────────────────────────────────
     # Replace plain "Lower Limit" / "Upper Limit" labels with labelled versions
     excel_headers = []
@@ -375,6 +370,69 @@ def save_report(
                 max_width = max(max_width, len(str(cell_val)))
 
         ws.column_dimensions[col_letter].width = max_width + 4   # padding
+
+
+def _channel_sheet_title(channel_name: str) -> str:
+    """
+    Converts an internal channel name like 'Att_Channel-1' into the
+    worksheet title 'Channel-1' used in the workbook.
+    """
+    return channel_name.replace("Att_", "")
+
+
+def save_report(
+    year: str,
+    channel_results: dict,
+    output_root: str = "Processed_Data",
+) -> Path:
+    """
+    Writes the exceedance report as a professionally formatted Excel workbook
+    (.xlsx) inside <output_root>/Exceedance_Tables/Exceedance_Table_<year>.xlsx
+
+    One worksheet is created per channel, named after the channel
+    (e.g. "Channel-1", "Channel-3"), in the same order as TARGET_CHANNELS.
+    Every worksheet uses the identical table format and formatting as before:
+
+    Columns  : Lower Limit (dB) | Upper Limit (dB) | <months...> | Total Seconds
+    Formatting:
+        • Bold, centre-aligned, light-blue header row
+        • Thin borders on every cell
+        • Numeric cells stored as numbers (not strings)
+        • Auto-adjusted column widths
+        • First row frozen
+
+    Parameters
+    ----------
+    channel_results : dict
+        Ordered mapping of channel_name -> (headers, rows), one entry per
+        channel in TARGET_CHANNELS order.
+
+    Creates the Exceedance_Tables folder automatically if it does not exist.
+    Returns the full Path of the saved workbook.
+    """
+    output_dir = Path(output_root) / "Exceedance_Tables"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    report_path = output_dir / f"Exceedance_Table_{year}.xlsx"
+
+    wb = Workbook()
+
+    # openpyxl creates one default sheet — reuse it for the first channel,
+    # then create additional sheets for every subsequent channel.
+    default_ws = wb.active
+    first = True
+
+    for channel_name, (headers, rows) in channel_results.items():
+        sheet_title = _channel_sheet_title(channel_name)
+
+        if first:
+            ws = default_ws
+            ws.title = sheet_title
+            first = False
+        else:
+            ws = wb.create_sheet(title=sheet_title)
+
+        _write_worksheet(ws, headers, rows)
 
     wb.save(report_path)
     return report_path
@@ -506,20 +564,42 @@ def main():
     def _on_month_done(month_label, idx, total):
         dash.month_scanned(month_label, idx, total)
 
-    thresholds, month_labels, counts = calculate_monthly_exceedance(
-        year_folder, progress_callback=_on_month_done
-    )
+    # Process every channel in TARGET_CHANNELS through the SAME pipeline.
+    # The dashboard is only wired to the FIRST channel's progress callback
+    # so the user sees a single, unified job instead of repeated progress
+    # output for each channel — subsequent channels reuse the identical
+    # month-folder scan silently in the background.
+    channel_results = {}
+    total_rows = 0
+    thresholds_count = 0
+    any_months_found = False
 
-    if not month_labels:
+    for i, channel_name in enumerate(TARGET_CHANNELS):
+        callback = _on_month_done if i == 0 else None
+
+        thresholds, month_labels, counts = calculate_monthly_exceedance(
+            year_folder, channel_name, progress_callback=callback
+        )
+
+        if not month_labels:
+            continue
+
+        any_months_found = True
+        upper_limit = CHANNEL_UPPER_LIMITS[channel_name]
+        headers, rows = build_table(thresholds, month_labels, counts, upper_limit)
+        channel_results[channel_name] = (headers, rows)
+        total_rows += len(rows)
+        thresholds_count = len(thresholds)
+
+    if not any_months_found:
         dash.close()
         print("No month folders found. Nothing to report.")
         return
 
     dash.set_stage("generating")
-    headers, rows = build_table(thresholds, month_labels, counts)
 
     dash.set_stage("saving")
-    report_path = save_report(year, headers, rows)
+    report_path = save_report(year, channel_results)
 
     dash.report_saved(report_path.name)
     dash.close()
@@ -531,11 +611,14 @@ def main():
     print("Location")
     print(f"  {report_path}")
     print()
+    print("Channels Processed")
+    print(f"  {', '.join(channel_results.keys())}")
+    print()
     print("Rows Generated")
-    print(f"  {len(rows)}")
+    print(f"  {total_rows}")
     print()
     print("Thresholds Processed")
-    print(f"  {len(thresholds)}")
+    print(f"  {thresholds_count}")
     print()
     print("Execution Time")
     print(f"  {elapsed:.2f}s")
