@@ -45,12 +45,25 @@ Y_AXIS_MAX  = 25                            # Fallback upper bound (overridden b
 TOP_PCT     = 0.05                          # Fraction used for reference level
 HOUR_TICKS  = [0, 3, 6, 9, 12, 15, 18, 21] # X-axis major tick positions (hrs)
 
-CHANNELS = [
+CHANNELS_CURRENT = [
     "Amp_Channel-1",
     "Amp_Channel-2",
     "Amp_Channel-3",
     "Amp_Channel-4",
 ]
+
+CHANNELS_LEGACY = [
+    "Amp_Channel-1",
+]
+
+# Active channel set for the current run. Defaults to the current dataset;
+# process_file() reassigns this at the start of each call based on the
+# selected dataset_mode ("current" or "legacy"). Every downstream function
+# (compute_references, compute_attenuation, report_max_attenuation,
+# save_per_second_file, plot_attenuation, calculate_dynamic_ymax) reads this
+# module-level list at call time, so no other function needs to change its
+# processing logic to support a different channel count.
+CHANNELS = CHANNELS_CURRENT
 
 # Circled-number Unicode characters for marker labels (supports up to 20)
 CIRCLED_DIGITS = [
@@ -164,6 +177,92 @@ def load_data(file_path: str, verbose: bool = True) -> pd.DataFrame:
     # Amplitude columns are already numeric after clean_dataframe();
     # a final dropna() guards against any residual edge-cases.
     df = df.dropna()
+    return df
+
+
+# ==============================================================================
+# LEGACY (2017) DATA LOADING — PREPROCESSING ONLY
+# ==============================================================================
+#
+# The legacy dataset uses a completely different raw format:
+#
+#     Time        Signal      Reference
+#     00000000    -11352      -12684
+#     00000100    -11349      -12681
+#
+# These two functions ONLY convert that raw format into the SAME internal
+# DataFrame shape the current engine already understands (Time as datetime,
+# one Amp_Channel-N column per channel). They do not calculate attenuation,
+# plot, or generate statistics — everything after this stage runs through
+# the existing, unmodified pipeline.
+# ==============================================================================
+
+def load_legacy_data(file_path: str, verbose: bool = True) -> pd.DataFrame:
+    """
+    Reads the raw legacy 2017 data file.
+
+    The file is whitespace-delimited with three unlabeled columns:
+        Time (8-digit code), Signal (raw units), Reference (raw units)
+
+    No conversion happens here — this function only reads the raw values.
+    """
+    df = pd.read_csv(
+        file_path,
+        sep=r"\s+",
+        engine="python",
+        header=None,
+        names=["Time_raw", "Signal_raw", "Reference_raw"],
+    )
+
+    if verbose:
+        print("\nLegacy Columns Found:")
+        print(df.columns.tolist())
+
+    return df
+
+
+def standardize_legacy_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts the raw legacy DataFrame into the standardized internal format
+    used everywhere else in the analysis engine.
+
+    Time conversion
+    ---------------
+    Legacy timestamps are 8-digit codes, e.g. '00000100'. The first six
+    digits are HHMMSS; the trailing two digits are always '00' and are
+    ignored.
+        '00000000' → '00:00:00'
+        '00000100' → '00:00:01'
+
+    Signal / Reference conversion
+    ------------------------------
+    Raw legacy values are stored ×100, e.g. -11352 → -113.52 dB.
+    Both Signal and Reference are divided by 100 and cast to float.
+
+    Resulting columns
+    -----------------
+        Time            — datetime64
+        Amp_Channel-1   — float (dB)
+        Reference       — float (dB)
+    """
+    df = df.copy()
+
+    # ── Time: take the first 6 digits as HHMMSS, drop the trailing 2 ──────────
+    time_code = df["Time_raw"].astype(str).str.zfill(8)
+    hh = time_code.str[0:2]
+    mm = time_code.str[2:4]
+    ss = time_code.str[4:6]
+    time_str = hh + ":" + mm + ":" + ss
+
+    df["Time"] = pd.to_datetime(time_str, format="%H:%M:%S", errors="coerce")
+
+    # ── Signal / Reference: divide by 100 to restore true dB values ──────────
+    df["Amp_Channel-1"] = pd.to_numeric(df["Signal_raw"], errors="coerce") / 100.0
+    df["Reference"]     = pd.to_numeric(df["Reference_raw"], errors="coerce") / 100.0
+
+    df = df[["Time", "Amp_Channel-1", "Reference"]]
+    df = df.dropna()
+
     return df
 
 
@@ -290,11 +389,12 @@ def report_max_attenuation(df: pd.DataFrame, verbose: bool = True) -> dict:
 
     maximum_attenuation = {}
 
-    for i in range(1, 5):
-        col = f"Att_Channel-{i}"
+    for ch in CHANNELS:
+        col = ch.replace("Amp_", "Att_")
         maximum_attenuation[col] = df[col].max()
         if verbose:
-            print(f"  CH{i}: {maximum_attenuation[col]:.2f} dB")
+            label = col.replace("Att_Channel-", "CH")
+            print(f"  {label}: {maximum_attenuation[col]:.2f} dB")
 
     return maximum_attenuation
 
@@ -630,43 +730,62 @@ def plot_attenuation(
     """
 
     att_cols     = [ch.replace("Amp_", "Att_") for ch in CHANNELS]
-    chan_labels  = [f"CH{i}" for i in range(1, 5)]
+    chan_labels  = [f"CH{i}" for i in range(1, len(CHANNELS) + 1)]
 
-    # --- Dynamic Y-axis upper limit (shared across all four subplots) --------
+    # --- Dynamic Y-axis upper limit (shared across all subplots) -------------
     y_max = calculate_dynamic_ymax(df)
 
-    # --- Figure & axes -------------------------------------------------------
-    fig, ax_grid = plt.subplots(
-        2, 2,
-        figsize=(15, 8),
-        sharex=False,           # keep axes independent so zoom is per-panel
-    )
-    fig.patch.set_facecolor("#F7F7F7")
+    if len(CHANNELS) == 1:
+        # --- Legacy (single-channel) mode: ONE plot only, same style --------
+        fig, ax = plt.subplots(figsize=(15, 5))
+        fig.patch.set_facecolor("#F7F7F7")
 
-    # Flatten the 2×2 grid to a list: [CH1, CH2, CH3, CH4]
-    axes_flat = [ax_grid[0, 0], ax_grid[0, 1], ax_grid[1, 0], ax_grid[1, 1]]
-
-    # --- Plot each channel in a loop (replaces the original CH1…CH4 blocks) --
-    line_artists = []
-
-    for idx, (ax, att_col, label) in enumerate(
-        zip(axes_flat, att_cols, chan_labels)
-    ):
-        show_xlabel = idx >= 2          # only bottom row gets X-axis label
-
-        # Downsample for rendering performance while preserving extremes.
-        # Uses every Nth sample so the interactive cursor still resolves to
-        # the original data (MarkerManager always queries the full df).
+        axes_flat = [ax]
         line, = ax.plot(
             df["Time"],
-            df[att_col],
+            df[att_cols[0]],
             linewidth=0.7,
-            color=f"C{idx}",            # Matplotlib's default colour cycle
-            label=label,
+            color="C0",
+            label=chan_labels[0],
         )
-        line_artists.append(line)
+        line_artists = [line]
 
-        format_axes(ax, label, show_xlabel, y_max=y_max)
+        format_axes(ax, chan_labels[0], True, y_max=y_max)
+
+    else:
+        # --- Current (4-channel) mode: unchanged 2×2 grid --------------------
+        # --- Figure & axes -----------------------------------------------------
+        fig, ax_grid = plt.subplots(
+            2, 2,
+            figsize=(15, 8),
+            sharex=False,           # keep axes independent so zoom is per-panel
+        )
+        fig.patch.set_facecolor("#F7F7F7")
+
+        # Flatten the 2×2 grid to a list: [CH1, CH2, CH3, CH4]
+        axes_flat = [ax_grid[0, 0], ax_grid[0, 1], ax_grid[1, 0], ax_grid[1, 1]]
+
+        # --- Plot each channel in a loop (replaces the original CH1…CH4 blocks) --
+        line_artists = []
+
+        for idx, (ax, att_col, label) in enumerate(
+            zip(axes_flat, att_cols, chan_labels)
+        ):
+            show_xlabel = idx >= 2          # only bottom row gets X-axis label
+
+            # Downsample for rendering performance while preserving extremes.
+            # Uses every Nth sample so the interactive cursor still resolves to
+            # the original data (MarkerManager always queries the full df).
+            line, = ax.plot(
+                df["Time"],
+                df[att_col],
+                linewidth=0.7,
+                color=f"C{idx}",            # Matplotlib's default colour cycle
+                label=label,
+            )
+            line_artists.append(line)
+
+            format_axes(ax, label, show_xlabel, y_max=y_max)
 
     # --- Overall figure title ------------------------------------------------
     # y=0.98 keeps the title fully inside the figure canvas so it is never
@@ -725,18 +844,22 @@ def process_file(
     show_plot: bool = True,
     verbose: bool = True,
     output_dir: str = None,
+    dataset_mode: str = "current",
 ) -> dict:
     """
     Public entry point for the analysis engine.
 
-    Loads the supplied NARL file, computes references and attenuation,
-    saves the per-minute attenuation file, optionally generates the
+    Loads the supplied file, computes references and attenuation,
+    saves the per-second attenuation file, optionally generates the
     interactive plot, and returns a result dictionary.
 
     Parameters
     ----------
     file_path : str
-        Path to a NARL daily data file, e.g. "data/NARL_14_5_2022.txt".
+        Path to a data file. For dataset_mode="current" this is a NARL
+        daily data file, e.g. "data/NARL_14_5_2022.txt". For
+        dataset_mode="legacy" this is a raw 2017-format file
+        (Time, Signal, Reference columns, no header).
     show_plot : bool, optional
         If True (default), opens the interactive matplotlib window with
         hover cursor, permanent markers, zoom/pan, and all existing
@@ -751,6 +874,12 @@ def process_file(
         Directory where generated files (txt and png) will be saved.
         If None, files are saved alongside the input file (legacy behaviour).
         The directory is created automatically if it does not exist.
+    dataset_mode : str, optional
+        "current" (default) processes the 2019-onwards 4-channel NARL format
+        exactly as before. "legacy" first converts the raw 2017 single-channel
+        format into the same internal DataFrame shape, then reuses the
+        identical processing pipeline (reference calculation, attenuation,
+        statistics, plotting, and output files) with a single channel.
 
     Returns
     -------
@@ -762,13 +891,21 @@ def process_file(
         "attenuation_dataframe" : pd.DataFrame — full-resolution attenuation data
     """
 
+    global CHANNELS
+    CHANNELS = CHANNELS_LEGACY if dataset_mode == "legacy" else CHANNELS_CURRENT
+
     # ── Date from filename ────────────────────────────────────────────────────
     date_str = extract_date_from_filename(file_path)
     if verbose:
         print(f"\nDate extracted from filename : {date_str}")
 
     # ── Data loading ─────────────────────────────────────────────────────────
-    df = load_data(file_path, verbose=verbose)
+    if dataset_mode == "legacy":
+        raw_df = load_legacy_data(file_path, verbose=verbose)
+        df = standardize_legacy_dataframe(raw_df)
+    else:
+        df = load_data(file_path, verbose=verbose)
+
     if verbose:
         print(f"Rows loaded (after NaN drop) : {len(df):,}")
 
@@ -808,3 +945,14 @@ def process_file(
         "second_dataframe"      : second_df,
         "attenuation_dataframe" : df,
     }
+
+
+# ==============================================================================
+# NOTE ON DATASET SELECTION
+# ==============================================================================
+#
+# The analysis engine never asks the user which dataset type to use.
+# dataset_mode is chosen exactly once, in main.py, and is propagated down
+# through batch_processor.py and utils.py to process_file() here. This
+# module simply receives and acts on the value it is given.
+# ==============================================================================
