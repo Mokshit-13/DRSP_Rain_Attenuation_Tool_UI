@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 import csv
 import math
+import re
 import sys
 import time
 import tkinter as tk
@@ -24,9 +25,15 @@ TARGET_CHANNELS = [                # Every channel listed here is analyzed
 ]                                   # here to change which channels are reported.
 
 CHANNEL_UPPER_LIMITS = {            # Highest threshold (dB), per channel.
-    "Att_Channel-1": 60.00,         # Every channel in TARGET_CHANNELS must
-    "Att_Channel-3": 58.00,         # have an entry here.
+    "Att_Channel-1": 54.00,         # Used when a detected channel matches
+    "Att_Channel-3": 58.00,         # one of these known entries.
 }
+
+DEFAULT_UPPER_LIMIT = 60.00         # Fallback ceiling for any detected
+                                    # channel with no entry above — keeps
+                                    # the engine compatible with datasets
+                                    # (e.g. legacy) whose channel set isn't
+                                    # pre-listed here.
 
 LOWER_LIMIT = 1.00                 # Lowest threshold (dB) — shared by all channels
 STEP_SIZE   = 0.10                 # Threshold step size (dB) — shared by all channels
@@ -85,17 +92,64 @@ def find_months(year_folder: str):
     )
 
 
+# Matches both legacy (Attenuation_NAR_D_M_YYYY.txt) and current
+# (Attenuation_NARL_D_M_YYYY.txt) processed filenames — the "L?" makes the
+# "L" optional so a single pattern covers both dataset generations.
+ATTENUATION_FILENAME_PATTERN = re.compile(
+    r"^Attenuation_NARL?_\d{1,2}_\d{1,2}_\d{4}\.txt$"
+)
+
+
 def find_attenuation_files(month_folder):
     """
-    Recursively finds every Attenuation_NARL_*.txt file inside a month
-    folder (one level down, inside each rainy-day folder).  PNG files are
-    ignored entirely.
+    Recursively finds every processed attenuation file inside a month
+    folder (one level down, inside each rainy-day folder), matching both
+    the legacy naming convention (Attenuation_NAR_D_M_YYYY.txt) and the
+    current naming convention (Attenuation_NARL_D_M_YYYY.txt).  PNG files
+    are ignored entirely.
 
     Returns a sorted list of file Paths.
     """
     month_path = Path(month_folder)
 
-    return sorted(month_path.rglob("Attenuation_NARL_*.txt"))
+    return sorted(
+        f for f in month_path.rglob("*.txt")
+        if ATTENUATION_FILENAME_PATTERN.match(f.name)
+    )
+
+
+def detect_available_channels(year_folder: str) -> list:
+    """
+    Scans every attenuation file found anywhere within the selected year
+    folder and returns the sorted list of Att_Channel-N columns that
+    actually exist in the processed data (union of headers across every
+    file found).
+
+    This lets the engine automatically adapt to whichever dataset
+    produced the processed files — Current Dataset (multiple channels)
+    or Legacy Dataset (a single channel) — without asking the user or
+    hardcoding a dataset type anywhere.
+    """
+    channels_found = set()
+
+    for month_folder in find_months(year_folder):
+        for file_path in find_attenuation_files(month_folder):
+            try:
+                with open(file_path, "r", newline="") as f:
+                    reader = csv.DictReader(f, delimiter="\t")
+                    fieldnames = reader.fieldnames or []
+            except (OSError, csv.Error):
+                continue
+
+            for name in fieldnames:
+                if re.match(r"^Att_Channel-\d+$", name):
+                    channels_found.add(name)
+
+    def _channel_sort_key(name: str) -> int:
+        match = re.search(r"(\d+)$", name)
+        return int(match.group(1)) if match else 0
+
+    return sorted(channels_found, key=_channel_sort_key)
 
 
 def _month_label(month_folder_name: str) -> str:
@@ -549,11 +603,21 @@ class Dashboard:
         return lines
 
 
+def _print_title() -> None:
+    """Displays the engine's own title banner at startup."""
+    width = 57
+    print("=" * width)
+    print("EXCEEDENCE ENGINE".center(width))
+    print("=" * width)
+
+
 # ==============================================================================
 # MAIN
 # ==============================================================================
 
 def main():
+    _print_title()
+
     start_time = time.monotonic()
 
     year_folder = select_year_folder()
@@ -564,7 +628,16 @@ def main():
     def _on_month_done(month_label, idx, total):
         dash.month_scanned(month_label, idx, total)
 
-    # Process every channel in TARGET_CHANNELS through the SAME pipeline.
+    # Automatically detect which attenuation channels exist in the selected
+    # year's processed data — no dataset type is asked or hardcoded here.
+    detected_channels = detect_available_channels(year_folder)
+
+    if not detected_channels:
+        dash.close()
+        print("No attenuation channels detected. Nothing to report.")
+        return
+
+    # Process every detected channel through the SAME pipeline.
     # The dashboard is only wired to the FIRST channel's progress callback
     # so the user sees a single, unified job instead of repeated progress
     # output for each channel — subsequent channels reuse the identical
@@ -574,7 +647,7 @@ def main():
     thresholds_count = 0
     any_months_found = False
 
-    for i, channel_name in enumerate(TARGET_CHANNELS):
+    for i, channel_name in enumerate(detected_channels):
         callback = _on_month_done if i == 0 else None
 
         thresholds, month_labels, counts = calculate_monthly_exceedance(
@@ -585,7 +658,7 @@ def main():
             continue
 
         any_months_found = True
-        upper_limit = CHANNEL_UPPER_LIMITS[channel_name]
+        upper_limit = CHANNEL_UPPER_LIMITS.get(channel_name, DEFAULT_UPPER_LIMIT)
         headers, rows = build_table(thresholds, month_labels, counts, upper_limit)
         channel_results[channel_name] = (headers, rows)
         total_rows += len(rows)
