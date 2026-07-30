@@ -25,8 +25,8 @@ TARGET_CHANNELS = [                # Every channel listed here is analyzed
 ]                                   # here to change which channels are reported.
 
 CHANNEL_UPPER_LIMITS = {            # Highest threshold (dB), per channel.
-    "Att_Channel-1": 54.00,         # Used when a detected channel matches
-    "Att_Channel-3": 58.00,         # one of these known entries.
+    "Att_Channel-1": 27.00,         # Used when a detected channel matches
+    "Att_Channel-3": 34.00,         # one of these known entries.
 }
 
 DEFAULT_UPPER_LIMIT = 60.00         # Fallback ceiling for any detected
@@ -271,7 +271,9 @@ def calculate_monthly_exceedance(year_folder: str, channel_name: str, progress_c
     counts : dict
         Nested dict: counts[month_label][threshold] = exceedance count (int)
     """
-    thresholds = _build_thresholds(CHANNEL_UPPER_LIMITS[channel_name])
+    thresholds = _build_thresholds(
+        CHANNEL_UPPER_LIMITS.get(channel_name, DEFAULT_UPPER_LIMIT)
+    )
 
     month_folders = find_months(year_folder)
 
@@ -319,15 +321,62 @@ def build_table(thresholds, month_labels, counts, upper_limit):
     upper_limit is the channel-specific ceiling used to fill the
     "Upper Limit" column (each channel may have its own value).
     """
-    headers = ["Lower Limit", "Upper Limit"] + month_labels + ["Total Seconds"]
+    headers = ["Lower Limit", "Upper Limit"] + month_labels + ["Total Seconds", "Exceedance Percentage (%)"]
+
+    SECONDS_PER_YEAR = 365 * 86400  # 31,536,000
 
     rows = []
 
-    for threshold in thresholds:
+    for i, threshold in enumerate(thresholds):
         month_counts = [counts[label][threshold] for label in month_labels]
         total_seconds = sum(month_counts)
 
-        row = [f"{threshold:.2f}", f"{upper_limit:.2f}"] + month_counts + [total_seconds]
+        if i == 0:
+            # First (lowest-threshold) row is always displayed as 1.000000,
+            # regardless of the computed percentage.
+            exceedance_pct = 1.0
+        else:
+            exceedance_pct = (total_seconds / SECONDS_PER_YEAR) * 100
+
+        row = [f"{threshold:.2f}", f"{upper_limit:.2f}"] + month_counts + [total_seconds, exceedance_pct]
+        rows.append(row)
+
+    return headers, rows
+
+
+def build_table_ratio(thresholds, month_labels, counts, upper_limit):
+    """
+    Method 2: Builds the output table using a RATIO-based Exceedance
+    Percentage instead of the % of the year.
+
+    Each row's "Exceedance Percentage (%)" = Total Seconds of that row
+    divided by the Total Seconds of the FIRST (lowest-threshold) row,
+    expressed as a percentage.
+
+    This makes the first row always exactly 100.000000 by definition, and
+    every subsequent row a percentage of that first value.
+
+    Everything else (columns, ordering, formatting) is identical to
+    build_table() / Method 1 — only the percentage formula differs.
+    """
+    headers = ["Lower Limit", "Upper Limit"] + month_labels + ["Total Seconds", "Exceedance Percentage (%)"]
+
+    rows = []
+    first_total_seconds = None
+
+    for i, threshold in enumerate(thresholds):
+        month_counts = [counts[label][threshold] for label in month_labels]
+        total_seconds = sum(month_counts)
+
+        if i == 0:
+            first_total_seconds = total_seconds
+
+        if first_total_seconds:
+            exceedance_percentage = (total_seconds / first_total_seconds) * 100
+        else:
+            exceedance_percentage = 0.0
+
+        row = [f"{threshold:.2f}", f"{upper_limit:.2f}"] + month_counts + [total_seconds, exceedance_percentage]
         rows.append(row)
 
     return headers, rows
@@ -395,12 +444,18 @@ def _write_worksheet(ws, headers, rows) -> None:
 
     # ── Write data rows ───────────────────────────────────────────────────────
     for row_idx, row_data in enumerate(rows, start=2):
+        last_col = len(row_data)
+        pct_col = last_col               # Exceedance Percentage (%) — last column
+        total_seconds_col = last_col - 1 # Total Seconds — second-to-last column
+
         for col_idx, value in enumerate(row_data, start=1):
             # Convert threshold strings ("1.00", "1.10" …) to float;
-            # leave month counts and Total Seconds as int.
+            # leave month counts and Total Seconds as int; percentage as float.
             if col_idx <= 2:                        # Lower / Upper Limit columns
                 cell_value = float(value)
-            elif col_idx == len(row_data):          # Total Seconds (last column)
+            elif col_idx == pct_col:                # Exceedance Percentage (%)
+                cell_value = float(value)
+            elif col_idx == total_seconds_col:       # Total Seconds
                 cell_value = int(value)
             else:                                   # Monthly counts
                 cell_value = int(value)
@@ -411,6 +466,8 @@ def _write_worksheet(ws, headers, rows) -> None:
             # Format threshold columns to 2 decimal places
             if col_idx <= 2:
                 cell.number_format = "0.00"
+            elif col_idx == pct_col:
+                cell.number_format = "0.000000"
 
     # ── Auto-adjust column widths ─────────────────────────────────────────────
     for col_idx, header_label in enumerate(excel_headers, start=1):
@@ -438,10 +495,11 @@ def save_report(
     year: str,
     channel_results: dict,
     output_root: str = "Processed_Data",
+    subfolder_name: str = "Exceedance_Tables",
 ) -> Path:
     """
     Writes the exceedance report as a professionally formatted Excel workbook
-    (.xlsx) inside <output_root>/Exceedance_Tables/Exceedance_Table_<year>.xlsx
+    (.xlsx) inside <output_root>/<subfolder_name>/Exceedance_Table_<year>.xlsx
 
     One worksheet is created per channel, named after the channel
     (e.g. "Channel-1", "Channel-3"), in the same order as TARGET_CHANNELS.
@@ -460,11 +518,16 @@ def save_report(
     channel_results : dict
         Ordered mapping of channel_name -> (headers, rows), one entry per
         channel in TARGET_CHANNELS order.
+    subfolder_name : str
+        Name of the folder (under output_root) to save into — lets the
+        same function be reused for different exceedance-calculation
+        methods (e.g. "Exceedence_by_Total_Seconds", "Exceedence_by_Ratio")
+        while keeping the report filename identical in each.
 
-    Creates the Exceedance_Tables folder automatically if it does not exist.
+    Creates the destination folder automatically if it does not exist.
     Returns the full Path of the saved workbook.
     """
-    output_dir = Path(output_root) / "Exceedance_Tables"
+    output_dir = Path(output_root) / subfolder_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     report_path = output_dir / f"Exceedance_Table_{year}.xlsx"
@@ -630,7 +693,11 @@ def main():
 
     # Automatically detect which attenuation channels exist in the selected
     # year's processed data — no dataset type is asked or hardcoded here.
-    detected_channels = detect_available_channels(year_folder)
+    detected_channels = [
+        channel
+        for channel in detect_available_channels(year_folder)
+        if channel in TARGET_CHANNELS
+    ]
 
     if not detected_channels:
         dash.close()
@@ -642,7 +709,8 @@ def main():
     # so the user sees a single, unified job instead of repeated progress
     # output for each channel — subsequent channels reuse the identical
     # month-folder scan silently in the background.
-    channel_results = {}
+    channel_results_total_seconds = {}
+    channel_results_ratio = {}
     total_rows = 0
     thresholds_count = 0
     any_months_found = False
@@ -659,8 +727,13 @@ def main():
 
         any_months_found = True
         upper_limit = CHANNEL_UPPER_LIMITS.get(channel_name, DEFAULT_UPPER_LIMIT)
+
         headers, rows = build_table(thresholds, month_labels, counts, upper_limit)
-        channel_results[channel_name] = (headers, rows)
+        channel_results_total_seconds[channel_name] = (headers, rows)
+
+        headers_ratio, rows_ratio = build_table_ratio(thresholds, month_labels, counts, upper_limit)
+        channel_results_ratio[channel_name] = (headers_ratio, rows_ratio)
+
         total_rows += len(rows)
         thresholds_count = len(thresholds)
 
@@ -672,20 +745,28 @@ def main():
     dash.set_stage("generating")
 
     dash.set_stage("saving")
-    report_path = save_report(year, channel_results)
+    report_path = save_report(
+        year, channel_results_total_seconds,
+        subfolder_name="Exceedence_by_Total_Seconds",
+    )
+    report_path_ratio = save_report(
+        year, channel_results_ratio,
+        subfolder_name="Exceedence_by_Ratio",
+    )
 
     dash.report_saved(report_path.name)
     dash.close()
 
     elapsed = time.monotonic() - start_time
 
-    print("\u2713 Report saved successfully")
+    print("\u2713 Reports saved successfully")
     print()
-    print("Location")
+    print("Locations")
     print(f"  {report_path}")
+    print(f"  {report_path_ratio}")
     print()
     print("Channels Processed")
-    print(f"  {', '.join(channel_results.keys())}")
+    print(f"  {', '.join(channel_results_total_seconds.keys())}")
     print()
     print("Rows Generated")
     print(f"  {total_rows}")
