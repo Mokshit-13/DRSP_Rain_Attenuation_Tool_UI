@@ -25,8 +25,8 @@ TARGET_CHANNELS = [                # Every channel listed here is analyzed
 ]                                   # here to change which channels are reported.
 
 CHANNEL_UPPER_LIMITS = {            # Highest threshold (dB), per channel.
-    "Att_Channel-1": 27.00,         # Used when a detected channel matches
-    "Att_Channel-3": 34.00,         # one of these known entries.
+    "Att_Channel-1": 28.00,         # Used when a detected channel matches
+    "Att_Channel-3": 36.00,         # one of these known entries.
 }
 
 DEFAULT_UPPER_LIMIT = 60.00         # Fallback ceiling for any detected

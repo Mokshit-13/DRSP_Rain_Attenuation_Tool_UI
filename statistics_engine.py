@@ -13,7 +13,7 @@ from tabulate import tabulate
 # CONFIGURATION
 # ==============================================================================
 
-TARGET_CHANNEL      = "Att_Channel-3"    # Only this channel is analyzed
+TARGET_CHANNEL      = "Att_Channel-1"    # Only this channel is analyzed
 TOP_N               = 3                 # Number of top values to report per month
 
 
